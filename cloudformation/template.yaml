@@ -1,0 +1,816 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: TrainHub - Serverless + VPC + RDS Multi-AZ + CloudFront(OAC)/S3(private) + API GW + Alarms/SNS
+
+Parameters:
+  DBUsername:
+    Type: String
+    Default: admin
+    MinLength: 1
+
+  DBName:
+    Type: String
+    Default: trainhub
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: SSH key for Bastion Host
+
+  AllowedSSHLocation:
+    Type: String
+    Default: "1.2.3.4/32"
+    Description: "SSH access from my ip"
+
+  AlarmEmail:
+    Type: String
+    Description: "Email to subscribe to SNS alarms"
+
+  StageName:
+    Type: String
+    Default: prod
+
+  ApiName:
+    Type: String
+    Default: Trainhub-API
+
+  Api5xxThreshold:
+    Type: Number
+    Default: 10
+
+Resources:
+  # VPC - Foundation for all networking resources
+  TrainHubVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true      # Required for private DNS resolution
+      EnableDnsHostnames: true    # Required for RDS endpoints
+      Tags:
+        - Key: Name
+          Value: trainhub-vpc
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      InternetGatewayId: !Ref IGW
+
+  # SUBNETS (2 PUBLIC / 2 PRIVATE) - Multi-AZ for high availability
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true   # Required for bastion host
+      Tags:
+        - Key: Name
+          Value: trainhub-public-a
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: trainhub-public-b
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: trainhub-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: trainhub-private-b
+
+  # ROUTE TABLES - Control network traffic flow
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      Tags:
+        - Key: Name
+          Value: trainhub-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW  # Must wait for IGW attachment
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW  # Route all internet traffic through IGW
+
+  AssocPubA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRT
+
+  AssocPubB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRT
+
+  PrivateRTA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      Tags:
+        - Key: Name
+          Value: trainhub-private-a-rt
+
+  PrivateRTB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref TrainHubVPC
+      Tags:
+        - Key: Name
+          Value: trainhub-private-b-rt
+
+  AssocPrivA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRTA
+
+  AssocPrivB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRTB
+
+  # SECURITY GROUPS - Firewall rules for resources
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bastion SSH access (restricted)
+      VpcId: !Ref TrainHubVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHLocation  # Only allow SSH from specific IP
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16  # Allow MySQL access to RDS in VPC
+      Tags:
+        - Key: Name
+          Value: trainhub-sg-bastion
+
+  LambdaSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda security group
+      VpcId: !Ref TrainHubVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/16  # Allow Lambda to access RDS MySQL
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16  # Allow Lambda to access Secrets Manager via endpoint
+      Tags:
+        - Key: Name
+          Value: trainhub-sg-lambda
+
+  RDSSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS security group
+      VpcId: !Ref TrainHubVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSG  # Allow Lambda connections
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BastionSG  # Allow Bastion connections
+      Tags:
+        - Key: Name
+          Value: trainhub-sg-rds
+
+  EndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Interface endpoint SG (Secrets Manager)
+      VpcId: !Ref TrainHubVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref LambdaSG  # Only Lambda can access endpoint
+      Tags:
+        - Key: Name
+          Value: trainhub-sg-endpoint
+
+  # BASTION HOST - Secure SSH access to private resources
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnetA  # Must be in public subnet
+      SecurityGroupIds:
+        - !Ref BastionSG
+      ImageId: ami-0683ee28af6610487  # Amazon Linux 2 AMI (region-specific)
+      Tags:
+        - Key: Name
+          Value: trainhub-bastion
+
+  # SECRETS MANAGER - Secure credential storage
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: trainhub-db-credentials
+      Description: TrainHub RDS credentials (generated password)
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}","dbname":"${DBName}"}'
+        GenerateStringKey: "password"
+        PasswordLength: 20
+        ExcludePunctuation: true  # Simpler passwords for MySQL compatibility
+
+  # VPC ENDPOINT (Secrets Manager) - Private connectivity to AWS services
+  SecretsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcId: !Ref TrainHubVPC
+      VpcEndpointType: Interface  # ENI-based endpoint in our subnets
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref EndpointSG
+      PrivateDnsEnabled: true  # Auto DNS resolution within VPC
+
+  # RDS (MySQL) + DB Subnet Group + Multi-AZ - Managed database
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: TrainHub DB subnets (private in 2 AZ)
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  TrainHubDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot  # Take snapshot before deletion
+    Properties:
+      DBInstanceIdentifier: trainhub-db
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: "8.0"
+      AllocatedStorage: 10
+      MultiAZ: true  # High availability across AZs
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RDSSG.GroupId
+      PubliclyAccessible: false  # Critical: Only accessible within VPC
+      StorageType: gp2
+      BackupRetentionPeriod: 7
+      DeletionProtection: false  # Set to true in production
+
+  # IAM ROLE + LAMBDA - Serverless compute
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole  # ENI management
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole      # CloudWatch logs
+      Policies:
+        - PolicyName: TrainHubSecretsReadOnly
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DBSecret
+        - PolicyName: TrainHubRDSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:connect  # IAM database authentication
+                Resource: !Sub "arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:${TrainHubDB}/admin"
+
+  BookingLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - TrainHubDB      # Wait for DB to be ready
+      - DBSecret        # Wait for secret creation
+      - SecretsEndpoint # Wait for endpoint creation
+    Properties:
+      FunctionName: trainhub-bookingsystem
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DBSecret
+          DB_ENDPOINT: !GetAtt TrainHubDB.Endpoint.Address  # RDS endpoint DNS
+          DB_NAME: !Ref DBName
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import pymysql
+          from botocore.exceptions import ClientError
+          
+          def get_db_connection():
+              """Hämta DB credentials och skapa connection"""
+              secrets_client = boto3.client('secretsmanager', region_name=os.environ['REGION'])
+              
+              try:
+                  response = secrets_client.get_secret_value(
+                      SecretId=os.environ['DB_SECRET_ARN']
+                  )
+                  secret = json.loads(response['SecretString'])
+                  
+                  connection = pymysql.connect(
+                      host=os.environ['DB_ENDPOINT'],
+                      user=secret['username'],
+                      password=secret['password'],
+                      database=os.environ['DB_NAME'],
+                      connect_timeout=5,
+                      cursorclass=pymysql.cursors.DictCursor
+                  )
+                  return connection
+                  
+              except (ClientError, pymysql.Error) as e:
+                  raise Exception(f"Database connection error: {e}")
+          
+          def lambda_handler(event, context):
+              http_method = event.get('httpMethod', 'GET')
+              
+              # GET /bookings/{member_id} - Hämta alla bokningar för en medlem
+              if http_method == 'GET' and 'member_id' in event.get('pathParameters', {}):
+                  member_id = event['pathParameters']['member_id']
+                  
+                  try:
+                      connection = get_db_connection()
+                      
+                      with connection.cursor() as cursor:
+                          cursor.callproc('GetMemberBookings', (int(member_id),))
+                          results = cursor.fetchall()
+                      
+                      connection.close()
+                      
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*'
+                          },
+                          'body': json.dumps({
+                              'member_id': member_id,
+                              'bookings': results
+                          })
+                      }
+                      
+                  except Exception as e:
+                      return {
+                          'statusCode': 500,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': str(e)})
+                      }
+              
+              # POST /bookings - Skapa ny bokning (använder stored procedure)
+              elif http_method == 'POST':
+                  try:
+                      body = json.loads(event.get('body', '{}'))
+                      member_id = body.get('member_id')
+                      pass_id = body.get('pass_id')
+                      
+                      if not member_id or not pass_id:
+                          return {
+                              'statusCode': 400,
+                              'headers': {'Content-Type': 'application/json'},
+                              'body': json.dumps({'error': 'Missing member_id or pass_id'})
+                          }
+                      
+                      connection = get_db_connection()
+                      
+                      with connection.cursor() as cursor:
+                          # Anropa stored procedure med output-parametrar
+                          cursor.callproc('CreateBooking', (
+                              int(member_id), 
+                              int(pass_id),
+                              '',  # p_status (OUT)
+                              0,   # p_booking_id (OUT)
+                              None,# p_booking_date (OUT)
+                              ''   # p_error_message (OUT)
+                          ))
+                          
+                          # Hämta resultatet från stored proceduren
+                          results = cursor.fetchall()
+                          if results:
+                              result = results[0]
+                              
+                              if result.get('p_status') == 'SUCCESS':
+                                  return {
+                                      'statusCode': 201,
+                                      'headers': {
+                                          'Content-Type': 'application/json',
+                                          'Access-Control-Allow-Origin': '*'
+                                      },
+                                      'body': json.dumps({
+                                          'message': 'Booking created successfully',
+                                          'booking_id': result.get('p_booking_id'),
+                                          'member_id': member_id,
+                                          'pass_id': pass_id,
+                                          'booking_date': str(result.get('p_booking_date')),
+                                          'status': 'active'
+                                      })
+                                  }
+                              else:
+                                  return {
+                                      'statusCode': 400,
+                                      'headers': {'Content-Type': 'application/json'},
+                                      'body': json.dumps({
+                                          'error': result.get('p_error_message', 'Booking failed')
+                                      })
+                                  }
+                          else:
+                              # Fallback om stored procedure inte returnerar förväntat resultat
+                              cursor.execute("""
+                                  INSERT INTO bookings (member_id, pass_id) 
+                                  VALUES (%s, %s)
+                              """, (member_id, pass_id))
+                              
+                              booking_id = cursor.lastrowid
+                              connection.commit()
+                              
+                              cursor.execute("""
+                                  SELECT * FROM bookings WHERE booking_id = %s
+                              """, (booking_id,))
+                              booking = cursor.fetchone()
+                              
+                              return {
+                                  'statusCode': 201,
+                                  'headers': {
+                                      'Content-Type': 'application/json',
+                                      'Access-Control-Allow-Origin': '*'
+                                  },
+                                  'body': json.dumps({
+                                      'message': 'Booking created (using direct insert)',
+                                      'booking_id': booking_id,
+                                      'member_id': member_id,
+                                      'pass_id': pass_id,
+                                      'booking_date': str(booking['booking_date']) if booking else None
+                                  })
+                              }
+                      
+                  except json.JSONDecodeError:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': 'Invalid JSON format'})
+                      }
+                  except Exception as e:
+                      return {
+                          'statusCode': 500,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({'error': str(e)})
+                      }
+                  finally:
+                      if 'connection' in locals():
+                          connection.close()
+              
+              # OPTIONS (CORS preflight)
+              elif http_method == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                          'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                      },
+                      'body': ''
+                  }
+              
+              else:
+                  return {
+                      'statusCode': 404,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Endpoint not found'})
+                  }
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSG
+        SubnetIds:
+          - !Ref PrivateSubnetA  # Lambda in private subnets
+          - !Ref PrivateSubnetB
+
+  # API GATEWAY - REST API with {member_id} path parameter
+  TrainHubApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiName
+      EndpointConfiguration:
+        Types:
+          - REGIONAL  # Lower latency than EDGE
+
+  # /bookings resource
+  BookingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ParentId: !GetAtt TrainHubApi.RootResourceId
+      PathPart: bookings
+
+  BookingsGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ResourceId: !Ref BookingsResource
+      HttpMethod: GET
+      AuthorizationType: NONE  # Public API (add auth in production)
+      Integration:
+        Type: AWS_PROXY  # Lambda proxy integration
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingLambda.Arn}/invocations"
+
+  BookingsPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ResourceId: !Ref BookingsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingLambda.Arn}/invocations"
+
+  BookingsOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ResourceId: !Ref BookingsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK  # Mock for CORS preflight
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  # /bookings/{member_id} resource
+  MemberIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ParentId: !Ref BookingsResource
+      PathPart: "{member_id}"  # Path parameter
+
+  MemberIdGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ResourceId: !Ref MemberIdResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.member_id: true  # Capture path parameter
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BookingLambda.Arn}/invocations"
+
+  MemberIdOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      ResourceId: !Ref MemberIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - BookingsGet
+      - BookingsPost
+      - BookingsOptions
+      - MemberIdGet
+      - MemberIdOptions
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      Description: TrainHub API deployment
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TrainHubApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref StageName
+
+  LambdaInvokePermissionForApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BookingLambda
+      Principal: apigateway.amazonaws.com  # Allow API Gateway to invoke
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TrainHubApi}/*/*/*"
+
+  # S3 + CloudFront - Frontend hosting
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true  # Bucket is completely private
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: trainhub-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4  # Modern signing protocol
+
+  CloudFrontDist:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            Id: FrontendS3
+            OriginAccessControlId: !Ref CloudFrontOAC  # OAC instead of legacy OAI
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3
+          ViewerProtocolPolicy: redirect-to-https  # Force HTTPS
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          ForwardedValues:
+            QueryString: false
+          Compress: true  # Gzip compression
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDist}"
+
+  # SNS + CLOUDWATCH ALARMS - Monitoring and alerting
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: trainhub-alarms
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: API-Errors-Trainhub
+      AlarmDescription: "API Gateway 5XX errors above threshold"
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Ref ApiName
+        - Name: Stage
+          Value: !Ref StageName
+      Statistic: Sum
+      Period: 300  # 5 minutes
+      EvaluationPeriods: 1
+      Threshold: !Ref Api5xxThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching  # Missing data = OK
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  DatabaseUnavailableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Database-Unavailable
+      AlarmDescription: "Treat missing DB metrics / 0 connections as unavailable signal"
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref TrainHubDB
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3  # 15 minutes of low/no connections
+      Threshold: 0
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: breaching  # Missing data = ALARM (DB might be down)
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  BastionIP:
+    Value: !GetAtt BastionHost.PublicIp
+    Description: Public IP for Bastion Host (SSH access)
+
+  CloudFrontURL:
+    Value: !Sub "https://${CloudFrontDist.DomainName}"
+    Description: CloudFront URL for frontend
+
+  ApiInvokeUrl:
+    Value: !Sub "https://${TrainHubApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Description: API Gateway endpoint URL
+
+  RDSSecretARN:
+    Value: !Ref DBSecret
+    Description: Secrets Manager ARN for RDS credentials
+
+  RDSInstanceIdentifier:
+    Value: !Ref TrainHubDB
+    Description: RDS MySQL instance identifier
