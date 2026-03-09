@@ -20,7 +20,7 @@ All application requests are processed through API Gateway and handled by AWS La
 
 # Network Topology
 
-![Network Topology](architecture/network-topology.png)
+![Network Topology](architecture/Network-Topology.png)
 
 The infrastructure is deployed inside a dedicated Amazon VPC.
 
