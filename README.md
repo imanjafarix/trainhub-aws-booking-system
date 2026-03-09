@@ -13,6 +13,27 @@ System flow:
 
 User → CloudFront → S3 → API Gateway → Lambda → RDS
 
+The system uses a serverless backend architecture where users interact with a static frontend hosted in Amazon S3 and distributed globally through Amazon CloudFront.  
+All application requests are processed through API Gateway and handled by AWS Lambda which communicates with the backend database in Amazon RDS.
+
+---
+
+# Network Topology
+
+![Network Topology](architecture/network-topology.png)
+
+The infrastructure is deployed inside a dedicated Amazon VPC.
+
+Public subnets:
+- Reserved for potential future resources such as a bastion host.
+
+Private subnets:
+- AWS Lambda (via ENI)
+- Amazon RDS database
+
+Sensitive components such as the database are isolated in private subnets and are not accessible from the public internet.  
+Security Groups ensure that only authorized services can communicate with each other.
+
 ---
 
 # AWS Services Used
@@ -36,11 +57,12 @@ User → CloudFront → S3 → API Gateway → Lambda → RDS
 Key security features:
 
 - Private VPC architecture
-- RDS in private subnets
-- IAM least privilege roles
-- Secrets stored in AWS Secrets Manager
+- RDS deployed in private subnets
+- IAM roles with least privilege access
+- Secrets stored securely in AWS Secrets Manager
 - No public database access
-- TLS encryption
+- TLS encryption for all API communication
+- Security Groups restricting network traffic
 
 ---
 
@@ -48,11 +70,7 @@ Key security features:
 
 The infrastructure is deployed using AWS CloudFormation.
 
-Example:
-
-aws cloudformation deploy \
---template-file template.yaml \
---stack-name trainhub-stack
+The CloudFormation template provisions networking, database infrastructure, serverless components, and monitoring resources automatically.
 
 ---
 
@@ -60,9 +78,9 @@ aws cloudformation deploy \
 
 Detailed documentation can be found in the **docs/** folder:
 
-Architecture design  
-Security report  
-Technical implementation
+- Architecture
+- Security
+- Technical-report
 
 ---
 
@@ -72,6 +90,7 @@ Technical implementation
 - Protect API using AWS WAF
 - Implement CI/CD pipeline
 - Add automated tests
+- Implement RDS Proxy for improved connection handling
 
 ---
 
