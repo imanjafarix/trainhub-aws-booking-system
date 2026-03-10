@@ -77,6 +77,18 @@ This approach keeps the application lightweight and allows automatic scaling bas
 
 ---
 
+# CloudFront CDN
+
+![CloudFront](screenshots/cloudfront.png)
+
+---
+
+## Monitoring
+
+![CloudWatch](screenshots/cloudwatch.png)
+
+---
+
 # Infrastructure as Code
 
 The infrastructure can be deployed using AWS CloudFormation.
