@@ -15,6 +15,10 @@ AWS Lambda
 Amazon RDS  
 AWS Secrets Manager  
 
+## API Gateway configuration
+
+![API Gateway](screenshots/API.png)
+
 API Gateway exposes REST endpoints used by the frontend application.
 
 Two primary endpoints were implemented:
@@ -27,9 +31,12 @@ Returns all bookings for a specific user.
 
 API Gateway forwards incoming requests to the Lambda function which processes the request and interacts with the database.
 
+
 ---
 
 # Lambda Function
+
+![Lambda Role](screenshots/Lambdaroll.png)
 
 The Lambda function is responsible for coordinating all backend operations.
 
@@ -55,6 +62,8 @@ The stored procedure performs the following checks:
 - updates the number of reserved slots
 
 This ensures that business rules remain consistent regardless of how the database is accessed.
+
+![Database](screenshots/SQL.png)
 
 ---
 
