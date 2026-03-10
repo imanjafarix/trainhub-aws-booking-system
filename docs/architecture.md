@@ -11,7 +11,7 @@ The goal of the architecture is to create a system that is:
 
 The solution uses managed AWS services to reduce operational overhead and allow the system to automatically scale based on demand.
 
-According to the project design, the system is divided into multiple layers to create a clear separation of responsibilities. :contentReference[oaicite:0]{index=0}
+According to the project design, the system is divided into multiple layers to create a clear separation of responsibilities.
 
 ---
 
