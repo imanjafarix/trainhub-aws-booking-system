@@ -83,10 +83,6 @@
                           cursor.callproc('CreateBooking', (
                               int(member_id), 
                               int(pass_id),
-                              '',  # p_status (OUT)
-                              0,   # p_booking_id (OUT)
-                              None,# p_booking_date (OUT)
-                              ''   # p_error_message (OUT)
                           ))
                           
                           # Hämta resultatet från stored proceduren
