@@ -46,6 +46,8 @@ Sensitive components such as the database are isolated inside private subnets an
 
 Security groups restrict network traffic so that only necessary communication between services is allowed.
 
+![VPC Security Groups](screenshots/VPC-SG.png)
+
 ---
 
 # Database Layer
