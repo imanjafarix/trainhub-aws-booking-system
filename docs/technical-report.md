@@ -95,6 +95,15 @@ These alarms send notifications through Amazon SNS to allow early detection of s
 
 ---
 
+## Application Interface
+
+The frontend provides a simple interface where users can view available training sessions and create bookings through the API.
+
+![Booking page](screenshots/Bookingpage.png)
+![Booking page](screenshots/bookingpage2.png)
+
+---
+
 # Summary
 
 The implementation demonstrates how a modern serverless architecture can be built using AWS managed services.
